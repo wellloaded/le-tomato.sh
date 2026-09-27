@@ -1,29 +1,31 @@
 # Execute this directly in the shell
 # ============================================================
 BASE="/opt/letsencrypt"
-DEFAULT_DOMAIN=$(nvram get https_crt_cn)
 # ============================================================
 
-SCRIPT_NAME="le-tomato.sh"
-
+DEFAULT_DOMAIN=$(nvram get https_crt_cn)
 [ -n "${DEFAULT_DOMAIN}" ] || {
     echo "ERROR: nvram https_crt_cn is empty"
     exit 1
 }
 
+SCRIPT_NAME="le-tomato.sh"
 mkdir -p "${BASE}" || exit 1
 SCRIPT_PATH="${BASE}/${SCRIPT_NAME}"
 
-cat > "${SCRIPT_PATH}" <<'LE_TOMATO_SCRIPT'
+cat > "${SCRIPT_PATH}" << EOF
 #!/bin/sh
 # ============================================================
-# Tomato64 – Let's Encrypt helper v1.1 - rs232
+# Tomato64 – Let's Encrypt helper v1.2 - rs232
 # ============================================================
-BASE="/opt/letsencrypt"
-SCRIPT_NAME="le-tomato.sh"
-SCRIPT_PATH="${BASE}/${SCRIPT_NAME}"
-DOMAIN=$(nvram get https_crt_cn)
+BASE="${BASE}"
+SCRIPT_NAME="${SCRIPT_NAME}"
+EOF
 
+cat >> "${SCRIPT_PATH}" <<'LE_TOMATO_SCRIPT'
+SCRIPT_PATH="${BASE}/${SCRIPT_NAME}"
+
+DOMAIN=$(nvram get https_crt_cn)
 ACME_HOME="${BASE}/.acme.sh"
 ACME="${ACME_HOME}/acme.sh"
 WEBROOT="${BASE}/webroot"
@@ -35,8 +37,8 @@ CRUNAME="le-tomato-renew"
 CERT="/etc/cert.pem"
 KEY="/etc/key.pem"
 ORIGINAL_CERT="${BASE}/original-https-crt-file"
+PORTFWD_RULE=""
 
-# Source NVRAM ops and system color definitions if available
 if [ -f /usr/sbin/nvram_ops ]; then
     . /usr/sbin/nvram_ops
 else
@@ -46,7 +48,6 @@ else
     f_light_red="\033[91m"
 fi
 
-# Logging Helpers
 logi(){ echo "$*" | logger -p user.info -t "${SCRIPT_NAME}[$$]"; }
 logn(){ echo "$*" | logger -p user.notice -t "${SCRIPT_NAME}[$$]"; }
 logw(){ echo "$*" | logger -p user.warn -t "${SCRIPT_NAME}[$$]"; }
@@ -57,7 +58,6 @@ msg_notice(){ echo -e "${f_light_green}$*${reset}"; logn "$*"; }
 msg_warn(){   echo -e "${f_light_yellow}WARNING: $*${reset}"; logw "WARNING: $*"; }
 die(){        echo -e "${f_light_red}ERROR: $*${reset}" >&2; loge "ERROR: $*"; exit 1; }
 
-# Persistent paths for domain keys/certs
 DOMAIN_DIR="${ACME_HOME}/${DOMAIN}"
 PERSIST_CERT="${DOMAIN_DIR}/fullchain.cer"
 PERSIST_KEY="${DOMAIN_DIR}/${DOMAIN}.key"
@@ -76,7 +76,9 @@ install_acme(){
         chmod 700 "${ACME}"
     fi
     [ -x "${ACME}" ] || die "could not install acme.sh"
+
     run_acme --set-default-ca --server letsencrypt --home "${ACME_HOME}" --config-home "${ACME_HOME}" >/dev/null 2>&1 || true
+
     if [ ! -f "${ACME_HOME}/account.conf" ]; then
         run_acme --register-account \
             --server letsencrypt \
@@ -98,14 +100,19 @@ save_original_nvram(){
 map_certificate(){
     [ -s "${CERT}" ] || die "missing ${CERT}"
     [ -s "${KEY}" ] || die "missing ${KEY}"
+
     ARCHIVE="/tmp/le-cert.tgz"
     ENCODED="/tmp/le-cert.b64"
+
     tar -C / -czf "${ARCHIVE}" etc/cert.pem etc/key.pem || die "could not create certificate archive"
     openssl enc -base64 -A -in "${ARCHIVE}" -out "${ENCODED}" || die "could not encode certificate archive"
+
     nvram set https_crt_file="$(cat "${ENCODED}")"
     nvram set https_crt_save=1
     nvram commit
+
     rm -f "${ARCHIVE}" "${ENCODED}"
+
     service httpd restart >/dev/null 2>&1 || service httpd start >/dev/null 2>&1 || die "could not restart httpd"
     msg_notice "certificate mapped to NVRAM and httpd restarted"
 }
@@ -114,9 +121,11 @@ restore_original_certificate(){
     [ -s "${ORIGINAL_CERT}" ] || die "original certificate backup not found"
     ORIGINAL="$(cat "${ORIGINAL_CERT}")"
     [ -n "${ORIGINAL}" ] || die "original certificate backup is empty"
+
     nvram set https_crt_file="${ORIGINAL}"
     nvram set https_crt_save=1
     nvram commit
+
     rm -f /etc/server.pem
     service httpd restart >/dev/null 2>&1 || service httpd start >/dev/null 2>&1 || die "could not restart httpd"
     msg_notice "original certificate restored"
@@ -126,6 +135,7 @@ create_handler(){
     cat > "${HANDLER}" <<'HANDLER'
 #!/bin/sh
 WEBROOT="/opt/letsencrypt/webroot"
+
 IFS= read -r REQUEST || exit 0
 METHOD=$(echo "${REQUEST}" | awk '{print $1}')
 URI=$(echo "${REQUEST}" | awk '{print $2}')
@@ -163,10 +173,40 @@ HANDLER
     chmod 700 "${HANDLER}"
 }
 
+# ------------------------------------------------------------------
+# Port-80 forward handling (wanin chain)
+# ------------------------------------------------------------------
+# If an exact --dport 80 ACCEPT rule exists on wanin it is saved in
+# PORTFWD_RULE and deleted so the temporary nc listener can receive
+# traffic.  stop_server (and every trap that calls it) always restores
+# the rule if it was present.
+
+remove_port80_forward(){
+    # Precise match: -A wanin ... --dport 80 ... -j ACCEPT  (never matches 180/801/…)
+    RULE=$(iptables -S wanin 2>/dev/null | \
+           grep -E '^-A wanin .*--dport[[:space:]]+80([[:space:]]|$).*-j ACCEPT' | \
+           head -n1)
+    [ -n "${RULE}" ] || return 0
+
+    PORTFWD_RULE="${RULE}"
+    iptables -D $(echo "${RULE}" | cut -d' ' -f2-) 2>/dev/null || true
+    logn "temporarily removed port-80 forward: ${RULE}"
+    echo -e "${f_light_yellow}temporarily removed existing port 80 forward${reset}"
+}
+
+restore_port80_forward(){
+    [ -n "${PORTFWD_RULE}" ] || return 0
+    iptables -A $(echo "${PORTFWD_RULE}" | cut -d' ' -f2-) 2>/dev/null || true
+    logn "restored previous port-80 forward"
+    echo -e "${f_light_green}restored previous port 80 forward${reset}"
+    PORTFWD_RULE=""
+}
+
 add_firewall(){
     if ! iptables -C INPUT -p tcp --dport 80 -j ACCEPT >/dev/null 2>&1; then
         iptables -I INPUT -p tcp --dport 80 -j ACCEPT || die "could not open port 80"
         echo 1 > "${FWFLAG}"
+        echo -e "${f_light_green}opening firewall port 80${reset}"
     fi
 }
 
@@ -174,6 +214,7 @@ remove_firewall(){
     if [ -f "${FWFLAG}" ]; then
         iptables -D INPUT -p tcp --dport 80 -j ACCEPT >/dev/null 2>&1 || true
         rm -f "${FWFLAG}"
+        echo -e "${f_light_green}closing firewall port 80${reset}"
     fi
 }
 
@@ -184,19 +225,24 @@ stop_server(){
         rm -f "${PIDFILE}"
     fi
     remove_firewall
-    msg_info "closing nc on port 80"
+    restore_port80_forward
+    echo -e "${f_light_green}closing nc on port 80${reset}"
 }
 
 start_server(){
     stop_server >/dev/null 2>&1 || true
     mkdir -p "${WEBROOT}/.well-known/acme-challenge" || die "could not create webroot"
     create_handler
+
+    # Must run before opening the INPUT rule / starting nc
+    remove_port80_forward
+
     add_firewall
     nc -lk -p 80 -e "${HANDLER}" &
     echo "$!" > "${PIDFILE}"
     sleep 1
     kill -0 "$(cat "${PIDFILE}" 2>/dev/null)" 2>/dev/null || die "nc failed to bind port 80"
-    msg_info "opening nc on port 80"
+    echo -e "${f_light_green}opening nc on port 80${reset}"
 }
 
 install_cron(){
@@ -238,15 +284,17 @@ copy_cert_to_ram(){
 issue_first_certificate(){
     mkdir "${LOCKDIR}" 2>/dev/null || die "another operation is running"
     trap 'stop_server; rm -rf "${LOCKDIR}"; exit' 0 1 2 3 15
+
     start_server
     msg_info "obtaining initial certificate for ${DOMAIN}"
-    
+
     SERVER_ARG="letsencrypt"
     if [ "$1" = "--staging" ]; then
         SERVER_ARG="letsencrypt_test"
         msg_warn "using Let's Encrypt Staging server"
     fi
 
+    ACME_LOG="/tmp/acme-issue.$$.log"
     run_acme --issue \
         --domain "${DOMAIN}" \
         --server "${SERVER_ARG}" \
@@ -254,9 +302,19 @@ issue_first_certificate(){
         --webroot "${WEBROOT}" \
         --home "${ACME_HOME}" \
         --config-home "${ACME_HOME}" \
-        --syslog 0
+        --syslog 0 2>&1 | tee "${ACME_LOG}"
 
-    [ -f "${PERSIST_CERT}" ] || die "initial certificate issuance failed"
+    if [ ! -f "${PERSIST_CERT}" ]; then
+        if grep -qiE "(Timeout during connect|likely firewall problem)" "${ACME_LOG}" 2>/dev/null; then
+            rm -f "${ACME_LOG}"
+            die "Validation timed out — WAN port 80 is unreachable from the Internet (check ISP port blocking or upstream firewall)"
+        else
+            rm -f "${ACME_LOG}"
+            die "initial certificate issuance failed"
+        fi
+    fi
+
+    rm -f "${ACME_LOG}"
     stop_server
     rm -rf "${LOCKDIR}"
     trap - 0 1 2 3 15
@@ -272,13 +330,16 @@ renew_certificate(){
 
     mkdir "${LOCKDIR}" 2>/dev/null || exit 0
     trap 'stop_server; rm -rf "${LOCKDIR}"; exit' 0 1 2 3 15
+
     start_server
     msg_info "certificate expires within 30 days; renewing"
+
     run_acme --renew \
         --domain "${DOMAIN}" \
         --home "${ACME_HOME}" \
         --config-home "${ACME_HOME}" \
         --syslog 0
+
     stop_server
     rm -rf "${LOCKDIR}"
     trap - 0 1 2 3 15
@@ -332,69 +393,116 @@ update(){
 }
 
 status() {
-    echo -e "=== Let's Encrypt Status ==============================="
-
-    # 1. Check persistent cert existence
-    if [ -s "${PERSIST_CERT}" ]; then
-        EXP_DATE=$(openssl x509 -enddate -noout -in "${PERSIST_CERT}" 2>/dev/null | cut -d= -f2)
+    echo -e "=== HTTPS Certificate Status ==========================="
+    
+    IS_LE_ACTIVE=0
+    STAGING_ACTIVE=0
+    if [ -s "${CERT}" ]; then
+        ACTIVE_FP=$(openssl x509 -noout -fingerprint -in "${CERT}" 2>/dev/null)
+        LE_FP=$(openssl x509 -noout -fingerprint -in "${PERSIST_CERT}" 2>/dev/null)
+        EXP_DATE=$(openssl x509 -enddate -noout -in "${CERT}" 2>/dev/null | cut -d= -f2)
         EXP_EPOCH=$(date -d "${EXP_DATE}" +%s 2>/dev/null || date -D "%b %d %T %Y %Z" -d "${EXP_DATE}" +%s 2>/dev/null)
         NOW_EPOCH=$(date +%s)
         
-        if is_staging_cert; then
-            CERT_STATUS="${f_light_yellow}STAGING CERTIFICATE (needs replacement)${reset}"
-        elif [ -n "${EXP_EPOCH}" ]; then
-            DAYS_LEFT=$(( (EXP_EPOCH - NOW_EPOCH) / 86400 ))
-            if [ "${DAYS_LEFT}" -gt 30 ]; then
-                CERT_STATUS="${f_light_green}VALID (${DAYS_LEFT} days left)${reset}"
-            elif [ "${DAYS_LEFT}" -gt 0 ]; then
-                CERT_STATUS="${f_light_yellow}EXPIRING SOON (${DAYS_LEFT} days left)${reset}"
+        if [ -n "${LE_FP}" ] && [ "${ACTIVE_FP}" = "${LE_FP}" ]; then
+            IS_LE_ACTIVE=1
+            if is_staging_cert; then
+                STAGING_ACTIVE=1
+                SEC_STATUS="${f_light_yellow}Let's Encrypt (Staging/Untrusted)${reset}"
             else
-                CERT_STATUS="${f_light_red}EXPIRED (${DAYS_LEFT} days ago)${reset}"
+                SEC_STATUS="${f_light_green}Let's Encrypt (Secure)${reset}"
             fi
         else
-            CERT_STATUS="${f_light_yellow}EXISTS (Could not parse expiry date)${reset}"
+            SEC_STATUS="${f_light_yellow}Built-in Default (Browser warning expected)${reset}"
+        fi
+
+        if [ -n "${EXP_EPOCH}" ] && [ "${EXP_EPOCH}" -lt 31536000 ]; then
+            EXP_STATUS="${f_light_yellow}Expired (Generated pre-NTP sync in 1970)${reset}"
+        elif [ -n "${EXP_EPOCH}" ] && [ -n "${NOW_EPOCH}" ]; then
+            DAYS_LEFT=$(( (EXP_EPOCH - NOW_EPOCH) / 86400 ))
+            if [ "${DAYS_LEFT}" -gt 30 ]; then
+                EXP_STATUS="${f_light_green}Valid (${DAYS_LEFT} days left)${reset}"
+            elif [ "${DAYS_LEFT}" -gt 0 ]; then
+                EXP_STATUS="${f_light_yellow}Expiring soon (${DAYS_LEFT} days left)${reset}"
+            else
+                ABS_DAYS=$(( -DAYS_LEFT ))
+                EXP_STATUS="${f_light_red}Expired (${ABS_DAYS} days ago)${reset}"
+            fi
+        else
+            EXP_STATUS="${f_light_yellow}Unknown${reset}"
         fi
     else
-        CERT_STATUS="${f_light_red}NOT FOUND (${PERSIST_CERT})${reset}"
+        SEC_STATUS="${f_light_red}No Active Certificate${reset}"
+        EXP_STATUS="${f_light_red}N/A${reset}"
     fi
 
-    # 2. Check RAM file placement
-    if [ -s "/etc/cert.pem" ] && [ -s "/etc/key.pem" ]; then
-        RAM_STATUS="${f_light_green}ACTIVE (/etc/cert.pem, /etc/key.pem)${reset}"
+    if [ -s "${PERSIST_CERT}" ]; then
+        if is_staging_cert; then
+            LE_DOWNLOAD="${f_light_yellow}Test/Staging Mode (Not a real cert)${reset}"
+        else
+            LE_DOWNLOAD="${f_light_green}Ready & Installed${reset}"
+        fi
     else
-        RAM_STATUS="${f_light_red}MISSING${reset}"
+        LE_DOWNLOAD="${f_light_yellow}Not Created Yet (Run 'le-tomato.sh start')${reset}"
     fi
 
-    # 3. Check NVRAM mapping
     NV_CRT=$(nvram get https_crt_file 2>/dev/null)
     if [ -n "${NV_CRT}" ]; then
-        NVRAM_STATUS="${f_light_green}MAPPED (${#NV_CRT} bytes)${reset}"
+        # Robust extraction: base64 → gzipped tar → cert.pem
+        NV_ISSUER=$(echo "${NV_CRT}" | openssl enc -base64 -d 2>/dev/null | tar -xzO etc/cert.pem 2>/dev/null | openssl x509 -noout -issuer 2>/dev/null)
+        if echo "${NV_ISSUER}" | grep -qiE "(staging|fake)"; then
+            FLASH_STATUS="${f_light_yellow}Saved (Let's Encrypt test cert)${reset}"
+        elif echo "${NV_ISSUER}" | grep -qi "Let's Encrypt"; then
+            FLASH_STATUS="${f_light_green}Saved (Will survive router reboots)${reset}"
+        else
+            if [ "${STAGING_ACTIVE}" -eq 1 ] || is_staging_cert; then
+                FLASH_STATUS="${f_light_yellow}Saved (Let's Encrypt test cert)${reset}"
+            else
+                FLASH_STATUS="${f_light_yellow}Saved (Built-in Tomato default cert)${reset}"
+            fi
+        fi
     else
-        NVRAM_STATUS="${f_light_red}UNSET (https_crt_file is empty)${reset}"
+        FLASH_STATUS="${f_light_red}Not Saved${reset}"
     fi
 
-    # 4. Check Cron Schedule
     CRON_ENTRY=$(cru l 2>/dev/null | grep -F "${CRUNAME}")
-    if [ -n "${CRON_ENTRY}" ]; then
-        CRON_SCHED=$(echo "${CRON_ENTRY}" | awk '{print $1,$2,$3,$4,$5}')
-        CRON_STATUS="${f_light_green}ACTIVE (${CRON_SCHED})${reset}"
+    if [ -s "${PERSIST_CERT}" ]; then
+        if is_staging_cert; then
+            CRON_STATUS="${f_light_yellow}Pending Upgrade (Will request prod cert on next run)${reset}"
+        elif [ -n "${CRON_ENTRY}" ]; then
+            CRON_STATUS="${f_light_green}Scheduled (Automatic weekly check)${reset}"
+        else
+            CRON_STATUS="${f_light_yellow}Off (Run 'le-tomato.sh start' to enable)${reset}"
+        fi
     else
-        CRON_STATUS="${f_light_red}NOT SCHEDULED${reset}"
+        CRON_STATUS="${f_light_yellow}Inactive (Requires initial Let's Encrypt setup)${reset}"
     fi
 
-    # Print Aligned Summary
-    printf "  %-20s : %b\n" "Domain"           "${DOMAIN:-Unconfigured}"
-    printf "  %-20s : %b\n" "Certificate"      "${CERT_STATUS}"
-    printf "  %-20s : %b\n" "RAM Copy"         "${RAM_STATUS}"
-    printf "  %-20s : %b\n" "NVRAM Status"     "${NVRAM_STATUS}"
-    printf "  %-20s : %b\n" "Cron Job"         "${CRON_STATUS}"
+    if [ "${STAGING_ACTIVE}" -eq 1 ] || is_staging_cert; then
+        ADVICE="Staging cert active. Run 'le-tomato.sh start' to request production cert."
+    elif [ "${IS_LE_ACTIVE}" -eq 1 ]; then
+        ADVICE="All good! Router web interface is secure."
+    elif [ -s "${PERSIST_CERT}" ]; then
+        ADVICE="Certificate downloaded but not applied. Run 'le-tomato.sh reload'."
+    else
+        ADVICE="Using default cert. Run 'le-tomato.sh start' to get Let's Encrypt."
+    fi
+
+    printf "  %-22s : %s\n" "Web Address (Domain)" "${DOMAIN:-Unconfigured}"
+    printf "  %-22s : %b\n" "HTTPS Security"       "${SEC_STATUS}"
+    printf "  %-22s : %b\n" "Certificate Validity" "${EXP_STATUS}"
+    printf "  %-22s : %b\n" "Let's Encrypt Cert"  "${LE_DOWNLOAD}"
+    printf "  %-22s : %b\n" "Router Flash Save"   "${FLASH_STATUS}"
+    printf "  %-22s : %b\n" "Auto-Renewal"        "${CRON_STATUS}"
+    echo -e "--------------------------------------------------------"
+    printf "  %-22s : %s\n" "Action / Advice"     "${ADVICE}"
     echo -e "========================================================"
 }
 
 help(){
     cat <<USAGE
 	
-Tomato64 – Let's Encrypt helper v1.1 - rs232
+Tomato64 – Let's Encrypt helper v1.2 - rs232
 
 Usage:  ${SCRIPT_NAME} start [--staging]   Install/load/cron cert (use --staging to bypass production rate limit)
         ${SCRIPT_NAME} stop                Unload certificate, restore default Tomato cert, remove cron
