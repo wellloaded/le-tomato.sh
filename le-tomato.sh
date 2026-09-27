@@ -3,13 +3,14 @@
 BASE="/opt/letsencrypt"
 # ============================================================
 
+SCRIPT_NAME="le-tomato.sh"
+
 DEFAULT_DOMAIN=$(nvram get https_crt_cn)
 [ -n "${DEFAULT_DOMAIN}" ] || {
     echo "ERROR: nvram https_crt_cn is empty"
     exit 1
 }
 
-SCRIPT_NAME="le-tomato.sh"
 mkdir -p "${BASE}" || exit 1
 SCRIPT_PATH="${BASE}/${SCRIPT_NAME}"
 
@@ -37,7 +38,8 @@ CRUNAME="le-tomato-renew"
 CERT="/etc/cert.pem"
 KEY="/etc/key.pem"
 ORIGINAL_CERT="${BASE}/original-https-crt-file"
-PORTFWD_RULE=""
+PORTFWD_FILTER=""
+PORTFWD_NAT=""
 
 if [ -f /usr/sbin/nvram_ops ]; then
     . /usr/sbin/nvram_ops
@@ -174,32 +176,61 @@ HANDLER
 }
 
 # ------------------------------------------------------------------
-# Port-80 forward handling (wanin chain)
+# Port-80 forward handling (filter wanin + nat WANPREROUTING)
 # ------------------------------------------------------------------
-# If an exact --dport 80 ACCEPT rule exists on wanin it is saved in
-# PORTFWD_RULE and deleted so the temporary nc listener can receive
-# traffic.  stop_server (and every trap that calls it) always restores
-# the rule if it was present.
+# Covers both classic --dport 80 and multiport --dports …80… rules.
+# The entire matching rule is temporarily removed (acceptable for the
+# few seconds of ACME validation) and always restored by stop_server
+# (normal exit or any trap).
+
+_port80_in_rule(){
+    # $1 = full rule line
+    # Returns 0 if the rule targets TCP port 80 (exact or multiport)
+    echo "$1" | grep -qE -- '--dport[[:space:]]+80([[:space:]]|$)' && return 0
+    if echo "$1" | grep -qE -- '--dports[[:space:]]+'; then
+        ports=$(echo "$1" | sed -n 's/.*--dports[[:space:]]\+\([^[:space:]]*\).*/\1/p')
+        echo ",${ports}," | grep -q ',80,' && return 0
+    fi
+    return 1
+}
 
 remove_port80_forward(){
-    # Precise match: -A wanin ... --dport 80 ... -j ACCEPT  (never matches 180/801/…)
-    RULE=$(iptables -S wanin 2>/dev/null | \
-           grep -E '^-A wanin .*--dport[[:space:]]+80([[:space:]]|$).*-j ACCEPT' | \
-           head -n1)
-    [ -n "${RULE}" ] || return 0
+    # --- filter table: wanin ACCEPT ---
+    RULE=$(iptables -S wanin 2>/dev/null | grep -E '^-A wanin ' | while read -r r; do
+        _port80_in_rule "$r" && { echo "$r"; break; }
+    done)
+    if [ -n "${RULE}" ]; then
+        PORTFWD_FILTER="${RULE}"
+        iptables -D $(echo "${RULE}" | cut -d' ' -f2-) 2>/dev/null || true
+        logn "temporarily removed filter port-80 forward: ${RULE}"
+        echo -e "${f_light_yellow}temporarily removed existing port 80 forward (filter)${reset}"
+    fi
 
-    PORTFWD_RULE="${RULE}"
-    iptables -D $(echo "${RULE}" | cut -d' ' -f2-) 2>/dev/null || true
-    logn "temporarily removed port-80 forward: ${RULE}"
-    echo -e "${f_light_yellow}temporarily removed existing port 80 forward${reset}"
+    # --- nat table: WANPREROUTING DNAT ---
+    RULE=$(iptables -t nat -S WANPREROUTING 2>/dev/null | grep -E '^-A WANPREROUTING ' | while read -r r; do
+        _port80_in_rule "$r" && { echo "$r"; break; }
+    done)
+    if [ -n "${RULE}" ]; then
+        PORTFWD_NAT="${RULE}"
+        iptables -t nat -D $(echo "${RULE}" | cut -d' ' -f2-) 2>/dev/null || true
+        logn "temporarily removed nat port-80 forward: ${RULE}"
+        echo -e "${f_light_yellow}temporarily removed existing port 80 forward (nat)${reset}"
+    fi
 }
 
 restore_port80_forward(){
-    [ -n "${PORTFWD_RULE}" ] || return 0
-    iptables -A $(echo "${PORTFWD_RULE}" | cut -d' ' -f2-) 2>/dev/null || true
-    logn "restored previous port-80 forward"
-    echo -e "${f_light_green}restored previous port 80 forward${reset}"
-    PORTFWD_RULE=""
+    if [ -n "${PORTFWD_FILTER}" ]; then
+        iptables -A $(echo "${PORTFWD_FILTER}" | cut -d' ' -f2-) 2>/dev/null || true
+        logn "restored previous filter port-80 forward"
+        echo -e "${f_light_green}restored previous port 80 forward (filter)${reset}"
+        PORTFWD_FILTER=""
+    fi
+    if [ -n "${PORTFWD_NAT}" ]; then
+        iptables -t nat -A $(echo "${PORTFWD_NAT}" | cut -d' ' -f2-) 2>/dev/null || true
+        logn "restored previous nat port-80 forward"
+        echo -e "${f_light_green}restored previous port 80 forward (nat)${reset}"
+        PORTFWD_NAT=""
+    fi
 }
 
 add_firewall(){
