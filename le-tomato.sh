@@ -17,7 +17,7 @@ SCRIPT_PATH="${BASE}/${SCRIPT_NAME}"
 cat > "${SCRIPT_PATH}" << EOF
 #!/bin/sh
 # ============================================================
-# Tomato64 – Let's Encrypt helper v1.2 - rs232
+# Tomato64 / FreshTomato – Let's Encrypt helper v1.3 - rs232
 # ============================================================
 BASE="${BASE}"
 SCRIPT_NAME="${SCRIPT_NAME}"
@@ -138,25 +138,21 @@ create_handler(){
 #!/bin/sh
 WEBROOT="/opt/letsencrypt/webroot"
 
-IFS= read -r REQUEST || exit 0
-METHOD=$(echo "${REQUEST}" | awk '{print $1}')
-URI=$(echo "${REQUEST}" | awk '{print $2}')
+# Hard limit: read at most 1024 bytes total (prevents large/slow payloads)
+REQUEST=$(dd bs=1024 count=1 2>/dev/null)
 
-while IFS= read -r HEADER; do
-    case "${HEADER}" in
-        ""|$(printf '\r')) break ;;
-    esac
-done
+METHOD=$(printf '%s' "$REQUEST" | awk 'NR==1 {print $1}')
+URI=$(printf '%s' "$REQUEST" | awk 'NR==1 {print $2}')
 
-[ "${METHOD}" = "GET" ] || {
+[ "$METHOD" = "GET" ] || {
     printf 'HTTP/1.0 405 Method Not Allowed\r\nConnection: close\r\n\r\n'
     exit 0
 }
 
-case "${URI}" in
+case "$URI" in
     /.well-known/acme-challenge/*)
         TOKEN="${URI#/.well-known/acme-challenge/}"
-        case "${TOKEN}" in
+        case "$TOKEN" in
             ""|*/*|*'?'*|*'&'*|*' '*|*..*) FILE="" ;;
             *) FILE="${WEBROOT}/.well-known/acme-challenge/${TOKEN}" ;;
         esac
@@ -164,10 +160,10 @@ case "${URI}" in
     *) FILE="" ;;
 esac
 
-if [ -n "${FILE}" ] && [ -f "${FILE}" ]; then
-    LENGTH=$(wc -c < "${FILE}" | tr -d '[:space:]')
-    printf 'HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %s\r\nConnection: close\r\n\r\n' "${LENGTH}"
-    cat "${FILE}"
+if [ -n "$FILE" ] && [ -f "$FILE" ]; then
+    LENGTH=$(wc -c < "$FILE" | tr -d '[:space:]')
+    printf 'HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %s\r\nConnection: close\r\n\r\n' "$LENGTH"
+    cat "$FILE"
 else
     printf 'HTTP/1.0 404 Not Found\r\nConnection: close\r\n\r\n'
 fi
@@ -178,14 +174,7 @@ HANDLER
 # ------------------------------------------------------------------
 # Port-80 forward handling (filter wanin + nat WANPREROUTING)
 # ------------------------------------------------------------------
-# Covers both classic --dport 80 and multiport --dports …80… rules.
-# The entire matching rule is temporarily removed (acceptable for the
-# few seconds of ACME validation) and always restored by stop_server
-# (normal exit or any trap).
-
 _port80_in_rule(){
-    # $1 = full rule line
-    # Returns 0 if the rule targets TCP port 80 (exact or multiport)
     echo "$1" | grep -qE -- '--dport[[:space:]]+80([[:space:]]|$)' && return 0
     if echo "$1" | grep -qE -- '--dports[[:space:]]+'; then
         ports=$(echo "$1" | sed -n 's/.*--dports[[:space:]]\+\([^[:space:]]*\).*/\1/p')
@@ -195,7 +184,6 @@ _port80_in_rule(){
 }
 
 remove_port80_forward(){
-    # --- filter table: wanin ACCEPT ---
     RULE=$(iptables -S wanin 2>/dev/null | grep -E '^-A wanin ' | while read -r r; do
         _port80_in_rule "$r" && { echo "$r"; break; }
     done)
@@ -206,7 +194,6 @@ remove_port80_forward(){
         echo -e "${f_light_yellow}temporarily removed existing port 80 forward (filter)${reset}"
     fi
 
-    # --- nat table: WANPREROUTING DNAT ---
     RULE=$(iptables -t nat -S WANPREROUTING 2>/dev/null | grep -E '^-A WANPREROUTING ' | while read -r r; do
         _port80_in_rule "$r" && { echo "$r"; break; }
     done)
@@ -257,7 +244,27 @@ stop_server(){
     fi
     remove_firewall
     restore_port80_forward
-    echo -e "${f_light_green}closing nc on port 80${reset}"
+    service httpd start >/dev/null 2>&1 || service httpd restart >/dev/null 2>&1 || true
+    echo -e "${f_light_green}closing listener on port 80${reset}"
+}
+
+find_nc(){
+    if command -v nc >/dev/null 2>&1 && nc -h 2>&1 | grep -q -- '-l'; then
+        NC_BIN="nc"
+        NC_LISTEN="-lk -p 80"
+        return 0
+    fi
+    if [ -x /opt/bin/netcat ] && /opt/bin/netcat -h 2>&1 | grep -q -- '-l'; then
+        NC_BIN="/opt/bin/netcat"
+        NC_LISTEN="-l -p 80"
+        return 0
+    fi
+    if command -v netcat >/dev/null 2>&1 && netcat -h 2>&1 | grep -q -- '-l'; then
+        NC_BIN="netcat"
+        NC_LISTEN="-l -p 80"
+        return 0
+    fi
+    return 1
 }
 
 start_server(){
@@ -265,15 +272,31 @@ start_server(){
     mkdir -p "${WEBROOT}/.well-known/acme-challenge" || die "could not create webroot"
     create_handler
 
-    # Must run before opening the INPUT rule / starting nc
     remove_port80_forward
-
     add_firewall
-    nc -lk -p 80 -e "${HANDLER}" &
+
+    find_nc || die "No suitable netcat found (need nc or netcat that supports -l)"
+
+    WAN_IF=$(nvram get wan_ifname)
+    WAN_IP=""
+    [ -n "$WAN_IF" ] && WAN_IP=$(ip -4 addr show dev "$WAN_IF" 2>/dev/null | awk '/inet / {print $2; exit}' | cut -d/ -f1)
+
+    # Temporarily free port 80 (Tomato httpd usually holds it)
+    service httpd stop >/dev/null 2>&1 || true
+    sleep 1
+
+    if [ -n "$WAN_IP" ]; then
+        # -s must come before -e for GNU netcat
+        timeout 30 $NC_BIN $NC_LISTEN -s "$WAN_IP" -e "${HANDLER}" &
+        echo -e "${f_light_green}opening listener on $WAN_IF ($WAN_IP:80) [timeout 30s]${reset}"
+    else
+        timeout 30 $NC_BIN $NC_LISTEN -e "${HANDLER}" &
+        echo -e "${f_light_green}opening listener on port 80 (all interfaces) [timeout 30s]${reset}"
+    fi
+
     echo "$!" > "${PIDFILE}"
     sleep 1
-    kill -0 "$(cat "${PIDFILE}" 2>/dev/null)" 2>/dev/null || die "nc failed to bind port 80"
-    echo -e "${f_light_green}opening nc on port 80${reset}"
+    kill -0 "$(cat "${PIDFILE}" 2>/dev/null)" 2>/dev/null || die "listener failed to bind port 80"
 }
 
 install_cron(){
@@ -479,8 +502,8 @@ status() {
 
     NV_CRT=$(nvram get https_crt_file 2>/dev/null)
     if [ -n "${NV_CRT}" ]; then
-        # Robust extraction: base64 → gzipped tar → cert.pem
         NV_ISSUER=$(echo "${NV_CRT}" | openssl enc -base64 -d 2>/dev/null | tar -xzO etc/cert.pem 2>/dev/null | openssl x509 -noout -issuer 2>/dev/null)
+
         if echo "${NV_ISSUER}" | grep -qiE "(staging|fake)"; then
             FLASH_STATUS="${f_light_yellow}Saved (Let's Encrypt test cert)${reset}"
         elif echo "${NV_ISSUER}" | grep -qi "Let's Encrypt"; then
@@ -488,6 +511,8 @@ status() {
         else
             if [ "${STAGING_ACTIVE}" -eq 1 ] || is_staging_cert; then
                 FLASH_STATUS="${f_light_yellow}Saved (Let's Encrypt test cert)${reset}"
+            elif [ "${IS_LE_ACTIVE}" -eq 1 ]; then
+                FLASH_STATUS="${f_light_green}Saved (Will survive router reboots)${reset}"
             else
                 FLASH_STATUS="${f_light_yellow}Saved (Built-in Tomato default cert)${reset}"
             fi
@@ -533,16 +558,16 @@ status() {
 help(){
     cat <<USAGE
 	
-Tomato64 – Let's Encrypt helper v1.2 - rs232
+    Tomato64 / FreshTomato – Let's Encrypt helper v1.3 - rs232
 
-Usage:  ${SCRIPT_NAME} start [--staging]   Install/load/cron cert (use --staging to bypass production rate limit)
-        ${SCRIPT_NAME} stop                Unload certificate, restore default Tomato cert, remove cron
-        ${SCRIPT_NAME} status              Show certificate and renewal status
-        ${SCRIPT_NAME} reload              Re-map saved certificate to Tomato NVRAM
+Usage:  ${SCRIPT_NAME} start [--staging]   Install/load/cron cert
+        ${SCRIPT_NAME} stop                Restore default cert + remove cron
+        ${SCRIPT_NAME} status              Show status
+        ${SCRIPT_NAME} reload              Re-map certificate to NVRAM
         ${SCRIPT_NAME} update              Update acme.sh
         ${SCRIPT_NAME} help                Show this help
 
-Add to Tomato64 Init or WAN Up:
+Add to Init / WAN Up:
         ${SCRIPT_PATH} start
 		
 USAGE
