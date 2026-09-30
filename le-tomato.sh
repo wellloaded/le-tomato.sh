@@ -1,5 +1,3 @@
-Here is the updated script.
-
 # Execute directly in the shell
 # ============================================================
 BASE="/opt/letsencrypt"
