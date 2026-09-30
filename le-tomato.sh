@@ -1,8 +1,9 @@
+Here is the updated script.
+
 # Execute directly in the shell
 # ============================================================
 BASE="/opt/letsencrypt"
 # ============================================================
-
 SCRIPT_NAME="le-tomato.sh"
 
 DEFAULT_DOMAIN=$(nvram get https_crt_cn)
@@ -14,14 +15,14 @@ DEFAULT_DOMAIN=$(nvram get https_crt_cn)
 mkdir -p "${BASE}" || exit 1
 SCRIPT_PATH="${BASE}/${SCRIPT_NAME}"
 
-cat > "${SCRIPT_PATH}" << EOF
+cat > "${SCRIPT_PATH}" << 'EOF'
 #!/bin/sh
 v="v1.5"
 # ============================================================
-# Tomato64 / FreshTomato – Let's Encrypt helper ${v} - rs232
+# Tomato64 – Let's Encrypt helper - ${v} - rs232
 # ============================================================
-BASE="${BASE}"
-SCRIPT_NAME="${SCRIPT_NAME}"
+BASE="/opt/letsencrypt"
+SCRIPT_NAME="le-tomato.sh"
 EOF
 
 cat >> "${SCRIPT_PATH}" <<'LE_TOMATO_SCRIPT'
@@ -39,20 +40,17 @@ CRUNAME="le-tomato-renew"
 CERT="/etc/cert.pem"
 KEY="/etc/key.pem"
 ORIGINAL_CERT="${BASE}/original-https-crt-file"
+
 PORTFWD_FILTER=""
 PORTFWD_NAT=""
 
-    . /usr/sbin/nvram_ops
+. /usr/sbin/nvram_ops
 
-logi(){ echo "$*" | logger -p user.info -t "${SCRIPT_NAME}[$$]"; }
-logn(){ echo "$*" | logger -p user.notice -t "${SCRIPT_NAME}[$$]"; }
-logw(){ echo "$*" | logger -p user.warn -t "${SCRIPT_NAME}[$$]"; }
-loge(){ echo "$*" | logger -p user.err -t "${SCRIPT_NAME}[$$]"; }
-
-msg_info(){   echo -e "${f_light_green}$*${reset}"; logi "$*"; }
-msg_notice(){ echo -e "${f_light_green}$*${reset}"; logn "$*"; }
-msg_warn(){   echo -e "${f_light_yellow}WARNING: $*${reset}"; logw "WARNING: $*"; }
-die(){        echo -e "${f_light_red}ERROR: $*${reset}" >&2; loge "ERROR: $*"; exit 1; }
+logi(){ echo -e "${f_light_green}$*${reset}"; echo "$*" | logger -p user.info -t "${SCRIPT_NAME}[$$]"; }
+logn(){ echo -e "${f_light_green}$*${reset}"; echo "$*" | logger -p user.notice -t "${SCRIPT_NAME}[$$]"; }
+logw(){ echo -e "${f_light_yellow}WARNING: $*${reset}"; echo "WARNING: $*" | logger -p user.warn -t "${SCRIPT_NAME}[$$]"; }
+loge(){ echo -e "${f_light_red}ERROR: $*${reset}" >&2; echo "ERROR: $*" | logger -p user.err -t "${SCRIPT_NAME}[$$]"; }
+die(){  echo -e "${f_light_red}ERROR: $*${reset}" >&2; loge "ERROR: $*"; exit 1; }
 
 DOMAIN_DIR="${ACME_HOME}/${DOMAIN}"
 PERSIST_CERT="${DOMAIN_DIR}/fullchain.cer"
@@ -64,16 +62,16 @@ get_lan_wan_access_status(){
     CUR_DNS=$(nvram get dnsmasq_custom 2>/dev/null)
 
     if echo "${CUR_DNS}" | grep -qF "${ENTRY}"; then
-        echo -e "${f_light_green}DNS Override (${DOMAIN} -> ${LAN_IP})${reset}"
+        echo -n -e "${f_light_green}DNS Override (${DOMAIN} -> ${LAN_IP})${reset}"
         return 0
     fi
 
     if [ "$(nvram get nf_loopback)" = "0" ]; then
-        echo -e "${f_light_green}NAT Loopback - All (Enabled)${reset}"
+        echo -n -e "${f_light_green}NAT Loopback - All (Enabled)${reset}"
         return 0
     fi
 
-    echo -e "${f_light_red}None / Unconfigured${reset}"
+    echo -n -e "${f_light_red}None / Unconfigured${reset}"
 }
 
 check_lan_wan_access(){
@@ -100,7 +98,7 @@ check_lan_wan_access(){
                         nvram set dnsmasq_custom="$(printf '%s\n%s' "${CUR_DNS}" "${ENTRY}")"
                         nvram commit
                         service dnsmasq restart >/dev/null 2>&1 || true
-                        msg_notice "Added LAN DNS override for ${DOMAIN} -> ${LAN_IP}"
+                        logn "Added LAN DNS override for ${DOMAIN} -> ${LAN_IP}"
                     fi
                     return 0
                     ;;
@@ -117,7 +115,7 @@ check_lan_wan_access(){
                 nvram set nf_loopback=0
                 nvram commit
                 service firewall restart >/dev/null 2>&1 || true
-                msg_notice "NAT Loopback enabled (nf_loopback=0)"
+                logn "NAT Loopback enabled (nf_loopback=0)"
                 ;;
         esac
     fi
@@ -129,6 +127,7 @@ run_acme(){
 
 install_acme(){
     mkdir -p "${ACME_HOME}" "${WEBROOT}/.well-known/acme-challenge" || die "could not create ACME directories"
+
     if [ ! -x "${ACME}" ]; then
         TMP="/tmp/acme.sh.$$"
         wget -qO "${TMP}" "https://raw.githubusercontent.com/acmesh-official/acme.sh/master/acme.sh" || die "could not download acme.sh"
@@ -136,6 +135,7 @@ install_acme(){
         mv "${TMP}" "${ACME}"
         chmod 700 "${ACME}"
     fi
+
     [ -x "${ACME}" ] || die "could not install acme.sh"
 
     run_acme --set-default-ca --server letsencrypt --home "${ACME_HOME}" --config-home "${ACME_HOME}" >/dev/null 2>&1 || true
@@ -147,6 +147,7 @@ install_acme(){
             --home "${ACME_HOME}" \
             --config-home "${ACME_HOME}" || die "could not initialize ACME account"
     fi
+
     logn "acme.sh ready"
 }
 
@@ -173,9 +174,8 @@ map_certificate(){
     nvram commit
 
     rm -f "${ARCHIVE}" "${ENCODED}"
-
     service httpd restart >/dev/null 2>&1 || service httpd start >/dev/null 2>&1 || die "could not restart httpd"
-    msg_notice "certificate mapped to NVRAM and httpd restarted"
+    logn "certificate mapped to NVRAM and httpd restarted"
 }
 
 restore_original_certificate(){
@@ -189,16 +189,14 @@ restore_original_certificate(){
 
     rm -f /etc/server.pem
     service httpd restart >/dev/null 2>&1 || service httpd start >/dev/null 2>&1 || die "could not restart httpd"
-    msg_notice "original certificate restored"
+    logn "original certificate restored"
 }
 
 create_handler(){
     cat > "${HANDLER}" <<'HANDLER'
 #!/bin/sh
 WEBROOT="/opt/letsencrypt/webroot"
-
 REQUEST=$(dd bs=1024 count=1 2>/dev/null)
-
 METHOD=$(printf '%s' "$REQUEST" | awk 'NR==1 {print $1}')
 URI=$(printf '%s' "$REQUEST" | awk 'NR==1 {print $2}')
 
@@ -246,7 +244,6 @@ remove_port80_forward(){
         PORTFWD_FILTER="${RULE}"
         iptables -D $(echo "${RULE}" | cut -d' ' -f2-) 2>/dev/null || true
         logn "temporarily removed filter port-80 forward: ${RULE}"
-        echo -e "${f_light_yellow}temporarily removed existing port 80 forward (filter)${reset}"
     fi
 
     RULE=$(iptables -t nat -S WANPREROUTING 2>/dev/null | grep -E '^-A WANPREROUTING ' | while read -r r; do
@@ -256,7 +253,6 @@ remove_port80_forward(){
         PORTFWD_NAT="${RULE}"
         iptables -t nat -D $(echo "${RULE}" | cut -d' ' -f2-) 2>/dev/null || true
         logn "temporarily removed nat port-80 forward: ${RULE}"
-        echo -e "${f_light_yellow}temporarily removed existing port 80 forward (nat)${reset}"
     fi
 }
 
@@ -264,13 +260,11 @@ restore_port80_forward(){
     if [ -n "${PORTFWD_FILTER}" ]; then
         iptables -A $(echo "${PORTFWD_FILTER}" | cut -d' ' -f2-) 2>/dev/null || true
         logn "restored previous filter port-80 forward"
-        echo -e "${f_light_green}restored previous port 80 forward (filter)${reset}"
         PORTFWD_FILTER=""
     fi
     if [ -n "${PORTFWD_NAT}" ]; then
         iptables -t nat -A $(echo "${PORTFWD_NAT}" | cut -d' ' -f2-) 2>/dev/null || true
         logn "restored previous nat port-80 forward"
-        echo -e "${f_light_green}restored previous port 80 forward (nat)${reset}"
         PORTFWD_NAT=""
     fi
 }
@@ -288,14 +282,12 @@ is_port80_open_in_input(){
 
 add_firewall(){
     if is_port80_open_in_input; then
-        echo -e "${f_light_green}port 80 already open in INPUT – skipping temporary rule${reset}"
         logn "port 80 already open in INPUT – skipping temporary rule"
         return 0
     fi
 
     iptables -I INPUT -p tcp --dport 80 -j ACCEPT || die "could not open port 80"
     echo 1 > "${FWFLAG}"
-    echo -e "${f_light_green}opening firewall port 80${reset}"
     logn "opened temporary INPUT accept for port 80"
 }
 
@@ -303,7 +295,6 @@ remove_firewall(){
     if [ -f "${FWFLAG}" ]; then
         iptables -D INPUT -p tcp --dport 80 -j ACCEPT >/dev/null 2>&1 || true
         rm -f "${FWFLAG}"
-        echo -e "${f_light_green}closing firewall port 80${reset}"
         logn "removed temporary INPUT accept for port 80"
     fi
 }
@@ -317,7 +308,7 @@ stop_server(){
     remove_firewall
     restore_port80_forward
     service httpd start >/dev/null 2>&1 || service httpd restart >/dev/null 2>&1 || true
-    echo -e "${f_light_green}closing listener on port 80${reset}"
+    logn "closing listener on port 80"
 }
 
 find_nc(){
@@ -326,24 +317,27 @@ find_nc(){
         NC_LISTEN="-lk -p 80"
         return 0
     fi
+
     if [ -x /opt/bin/netcat ] && /opt/bin/netcat -h 2>&1 | grep -q -- '-l'; then
         NC_BIN="/opt/bin/netcat"
         NC_LISTEN="-l -p 80"
         return 0
     fi
+
     if command -v netcat >/dev/null 2>&1 && netcat -h 2>&1 | grep -q -- '-l'; then
         NC_BIN="netcat"
         NC_LISTEN="-l -p 80"
         return 0
     fi
+
     return 1
 }
 
 start_server(){
     stop_server >/dev/null 2>&1 || true
     mkdir -p "${WEBROOT}/.well-known/acme-challenge" || die "could not create webroot"
-    create_handler
 
+    create_handler
     remove_port80_forward
     add_firewall
 
@@ -358,24 +352,30 @@ start_server(){
 
     if [ -n "$WAN_IP" ]; then
         $NC_BIN $NC_LISTEN -s "$WAN_IP" -e "${HANDLER}" &
-        echo -e "${f_light_green}opening listener on $WAN_IF ($WAN_IP:80)${reset}"
+        logn "opening listener on $WAN_IF ($WAN_IP:80)"
     else
         $NC_BIN $NC_LISTEN -e "${HANDLER}" &
-        echo -e "${f_light_green}opening listener on port 80 (all interfaces)${reset}"
+        logn "opening listener on port 80 (all interfaces)"
     fi
 
     echo "$!" > "${PIDFILE}"
     sleep 1
+
     kill -0 "$(cat "${PIDFILE}" 2>/dev/null)" 2>/dev/null || die "listener failed to bind port 80"
 }
 
 install_cron(){
-    cru l 2>/dev/null | grep -F "${CRUNAME}" >/dev/null 2>&1 && return 0
+    if cru l 2>/dev/null | grep -F "${CRUNAME}" >/dev/null 2>&1; then
+        printf "  %-22s : %b\n" "Scheduled Update" "${f_light_green}enabled${reset}"
+        return 0
+    fi
+
     MIN=$(awk 'BEGIN{srand(); print int(rand()*60)}')
     HOUR=$(awk 'BEGIN{srand(); print int(rand()*5)+1}')
     DOW=$(awk 'BEGIN{srand(); print int(rand()*7)}')
-    msg_info "installing cron renewal job (${MIN} ${HOUR} * * ${DOW})"
+
     cru a "${CRUNAME}" "${MIN} ${HOUR} * * ${DOW} ${SCRIPT_PATH} renew" || die "could not install renewal job"
+    printf "  %-22s : %b\n" "Scheduled Update" "${f_light_yellow}enabling it now${reset}"
 }
 
 remove_cron(){
@@ -400,15 +400,16 @@ issue_first_certificate(){
     trap 'stop_server; rm -rf "${LOCKDIR}"; exit' 0 1 2 3 15
 
     start_server
-    msg_info "obtaining initial certificate for ${DOMAIN}"
+    logi "obtaining initial certificate for ${DOMAIN}"
 
     SERVER_ARG="letsencrypt"
     if [ "$1" = "--staging" ]; then
         SERVER_ARG="letsencrypt_test"
-        msg_warn "using Let's Encrypt Staging server"
+        logw "using Let's Encrypt Staging server"
     fi
 
     ACME_LOG="/tmp/acme-issue.$$.log"
+
     run_acme --issue \
         --domain "${DOMAIN}" \
         --server "${SERVER_ARG}" \
@@ -436,7 +437,7 @@ issue_first_certificate(){
 
 renew_certificate(){
     if is_staging_cert; then
-        msg_warn "staging certificate detected during renewal; requesting production certificate"
+        logw "staging certificate detected during renewal; requesting production certificate"
         rm -rf "${DOMAIN_DIR}"
         issue_first_certificate
         return 0
@@ -446,7 +447,7 @@ renew_certificate(){
     trap 'stop_server; rm -rf "${LOCKDIR}"; exit' 0 1 2 3 15
 
     start_server
-    msg_info "certificate expires within 30 days; renewing"
+    logi "certificate expires within 30 days; renewing"
 
     run_acme --renew \
         --domain "${DOMAIN}" \
@@ -465,12 +466,11 @@ start(){
     if [ -s "${PERSIST_CERT}" ] && [ -s "${PERSIST_KEY}" ]; then
         copy_cert_to_ram
         if openssl x509 -checkend 2592000 -noout -in "${PERSIST_CERT}" >/dev/null 2>&1 && ! is_staging_cert; then
-            msg_info "using valid existing certificate from ${PERSIST_CERT}"
+            echo ""
+            echo "  using valid existing certificate from ${PERSIST_CERT}"
             check_lan_wan_access
-            map_certificate
+            printf "  %-22s : %b\n" "LAN to WAN Access" "$(get_lan_wan_access_status)"
             install_cron
-            echo -e "LAN to WAN Access   : $(get_lan_wan_access_status)"
-            msg_notice "start completed successfully"
             return 0
         fi
     fi
@@ -478,7 +478,7 @@ start(){
     install_acme
 
     if is_staging_cert && [ "$1" != "--staging" ]; then
-        msg_warn "staging certificate detected; replacing with production certificate"
+        logw "staging certificate detected; replacing with production certificate"
         rm -rf "${DOMAIN_DIR}"
         save_original_nvram
         issue_first_certificate
@@ -496,16 +496,15 @@ start(){
     save_original_nvram
     check_lan_wan_access
     map_certificate
+    printf "  %-22s : %b\n" "LAN to WAN Access" "$(get_lan_wan_access_status)"
     install_cron
-    echo -e "LAN to WAN Access   : $(get_lan_wan_access_status)"
-    msg_notice "start completed successfully"
 }
 
 stop(){
     stop_server
     remove_cron
     restore_original_certificate
-    msg_notice "stopped; persistent certificate retained in /opt"
+    logn "stopped; persistent certificate retained in /opt"
 }
 
 reload(){
@@ -515,21 +514,18 @@ reload(){
 update(){
     [ -x "${ACME}" ] || die "acme.sh not found"
     run_acme --upgrade --home "${ACME_HOME}" --config-home "${ACME_HOME}" || die "acme.sh update failed"
-    msg_notice "acme.sh updated"
+    logn "acme.sh updated"
 }
 
 status() {
     echo -e "=== HTTPS Certificate Status ${v} ======================"
-    
     IS_LE_ACTIVE=0
     STAGING_ACTIVE=0
+
     if [ -s "${CERT}" ]; then
         ACTIVE_FP=$(openssl x509 -noout -fingerprint -in "${CERT}" 2>/dev/null)
         LE_FP=$(openssl x509 -noout -fingerprint -in "${PERSIST_CERT}" 2>/dev/null)
-        EXP_DATE=$(openssl x509 -enddate -noout -in "${CERT}" 2>/dev/null | cut -d= -f2)
-        EXP_EPOCH=$(date -d "${EXP_DATE}" +%s 2>/dev/null || date -D "%b %d %T %Y %Z" -d "${EXP_DATE}" +%s 2>/dev/null)
-        NOW_EPOCH=$(date +%s)
-        
+
         if [ -n "${LE_FP}" ] && [ "${ACTIVE_FP}" = "${LE_FP}" ]; then
             IS_LE_ACTIVE=1
             if is_staging_cert; then
@@ -541,6 +537,23 @@ status() {
         else
             SEC_STATUS="${f_light_yellow}Built-in Default (Browser warning expected)${reset}"
         fi
+    else
+        SEC_STATUS="${f_light_red}No Active Certificate${reset}"
+    fi
+
+    # Let's Encrypt status and expiration evaluation
+    if [ -s "${PERSIST_CERT}" ]; then
+        if is_staging_cert; then
+            LE_DOWNLOAD="${f_light_yellow}Test/Staging Mode (Not a real cert)${reset}"
+        elif [ "${IS_LE_ACTIVE}" -eq 1 ]; then
+            LE_DOWNLOAD="${f_light_green}Active & Installed${reset}"
+        else
+            LE_DOWNLOAD="${f_light_yellow}Ready but not active${reset}"
+        fi
+
+        EXP_DATE=$(openssl x509 -enddate -noout -in "${PERSIST_CERT}" 2>/dev/null | cut -d= -f2)
+        EXP_EPOCH=$(date -d "${EXP_DATE}" +%s 2>/dev/null || date -D "%b %d %T %Y %Z" -d "${EXP_DATE}" +%s 2>/dev/null)
+        NOW_EPOCH=$(date +%s)
 
         if [ -n "${EXP_EPOCH}" ] && [ "${EXP_EPOCH}" -lt 31536000 ]; then
             EXP_STATUS="${f_light_yellow}Expired (Generated pre-NTP sync in 1970)${reset}"
@@ -558,24 +571,13 @@ status() {
             EXP_STATUS="${f_light_yellow}Unknown${reset}"
         fi
     else
-        SEC_STATUS="${f_light_red}No Active Certificate${reset}"
-        EXP_STATUS="${f_light_red}N/A${reset}"
-    fi
-
-    if [ -s "${PERSIST_CERT}" ]; then
-        if is_staging_cert; then
-            LE_DOWNLOAD="${f_light_yellow}Test/Staging Mode (Not a real cert)${reset}"
-        else
-            LE_DOWNLOAD="${f_light_green}Ready & Installed${reset}"
-        fi
-    else
         LE_DOWNLOAD="${f_light_yellow}Not Created Yet (Run 'le-tomato.sh start')${reset}"
+        EXP_STATUS="${f_light_red}N/A${reset}"
     fi
 
     NV_CRT=$(nvram get https_crt_file 2>/dev/null)
     if [ -n "${NV_CRT}" ]; then
         NV_ISSUER=$(echo "${NV_CRT}" | openssl enc -base64 -d 2>/dev/null | tar -xzO etc/cert.pem 2>/dev/null | openssl x509 -noout -issuer 2>/dev/null)
-
         if echo "${NV_ISSUER}" | grep -qiE "(staging|fake)"; then
             FLASH_STATUS="${f_light_yellow}Saved (Let's Encrypt test cert)${reset}"
         elif echo "${NV_ISSUER}" | grep -qi "Let's Encrypt"; then
@@ -619,10 +621,10 @@ status() {
     fi
 
     printf "  %-22s : %s\n" "Web Address (Domain)" "${DOMAIN:-Unconfigured}"
-    printf "  %-22s : %b\n" "LAN to WAN Access"   "${ROUTE_STATUS}"	
+    printf "  %-22s : %b\n" "LAN to WAN Access"   "${ROUTE_STATUS}"
     printf "  %-22s : %b\n" "HTTPS Security"       "${SEC_STATUS}"
-    printf "  %-22s : %b\n" "Certificate Validity" "${EXP_STATUS}"
-    printf "  %-22s : %b\n" "Let's Encrypt Cert"  "${LE_DOWNLOAD}"
+    printf "  %-22s : %b\n" "LE Certificate Status"  "${LE_DOWNLOAD}"
+    printf "  %-22s : %b\n" "LE Certificate Term" "${EXP_STATUS}"
     printf "  %-22s : %b\n" "Router Flash Save"   "${FLASH_STATUS}"
     printf "  %-22s : %b\n" "Auto-Renewal"        "${CRON_STATUS}"
     echo -e "--------------------------------------------------------"
@@ -631,21 +633,16 @@ status() {
 }
 
 help(){
-    cat << 'USAGE'
-	
-Tomato64 / FreshTomato – Let's Encrypt helper ${v} - rs232
-
-Usage:  ${SCRIPT_NAME} start [--staging]   Install/load/cron cert
-        ${SCRIPT_NAME} stop                Restore default cert + remove cron
-        ${SCRIPT_NAME} status              Show status
-        ${SCRIPT_NAME} reload              Re-map certificate to NVRAM
-        ${SCRIPT_NAME} update              Update acme.sh
-        ${SCRIPT_NAME} help                Show this help
-
-Add to Init / WAN Up:
-        ${SCRIPT_PATH} start
-		
-USAGE
+    echo "Tomato64 / FreshTomato – Let's Encrypt helper ${v} - rs232"
+    echo "Usage:  ${SCRIPT_NAME} start [--staging]   Install/load/cron cert"
+    echo "        ${SCRIPT_NAME} stop                Restore default cert + remove cron"
+    echo "        ${SCRIPT_NAME} status              Show status"
+    echo "        ${SCRIPT_NAME} reload              Re-map certificate to NVRAM"
+    echo "        ${SCRIPT_NAME} update              Update acme.sh"
+    echo "        ${SCRIPT_NAME} help                Show this help"
+    echo ""
+    echo "Add to Init / WAN Up:"
+    echo "        ${SCRIPT_PATH} start"
 }
 
 case "$1" in
