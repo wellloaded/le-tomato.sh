@@ -620,7 +620,8 @@ status() {
         ADVICE="Using default cert. Run 'le-tomato.sh start' to get Let's Encrypt."
     fi
 
-    printf "  %-22s : %s\n" "Web Address (Domain)" "${DOMAIN:-Unconfigured}"
+    printf "
+  %-22s : %s\n" "Web Address (Domain)" "${DOMAIN:-Unconfigured}"
     printf "  %-22s : %b\n" "LAN to WAN Access"   "${ROUTE_STATUS}"
     printf "  %-22s : %b\n" "HTTPS Security"       "${SEC_STATUS}"
     printf "  %-22s : %b\n" "LE Certificate Status"  "${LE_DOWNLOAD}"
@@ -629,11 +630,14 @@ status() {
     printf "  %-22s : %b\n" "Auto-Renewal"        "${CRON_STATUS}"
     echo -e "--------------------------------------------------------"
     printf "  %-22s : %s\n" "Action / Advice"     "${ADVICE}"
-    echo -e "========================================================"
+    echo -e "========================================================
+	"
 }
 
 help(){
-    echo "Tomato64 / FreshTomato – Let's Encrypt helper ${v} - rs232"
+    echo "
+	Tomato64 / FreshTomato – Let's Encrypt helper ${v} - rs232
+	"
     echo "Usage:  ${SCRIPT_NAME} start [--staging]   Install/load/cron cert"
     echo "        ${SCRIPT_NAME} stop                Restore default cert + remove cron"
     echo "        ${SCRIPT_NAME} status              Show status"
@@ -642,7 +646,8 @@ help(){
     echo "        ${SCRIPT_NAME} help                Show this help"
     echo ""
     echo "Add to Init / WAN Up:"
-    echo "        ${SCRIPT_PATH} start"
+    echo "        ${SCRIPT_PATH} start
+	"
 }
 
 case "$1" in
