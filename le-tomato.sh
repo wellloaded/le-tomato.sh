@@ -16,8 +16,9 @@ SCRIPT_PATH="${BASE}/${SCRIPT_NAME}"
 
 cat > "${SCRIPT_PATH}" << EOF
 #!/bin/sh
+v="v1.4"
 # ============================================================
-# Tomato64 / FreshTomato – Let's Encrypt helper v1.3 - rs232
+# Tomato64 / FreshTomato – Let's Encrypt helper ${v} - rs232
 # ============================================================
 BASE="${BASE}"
 SCRIPT_NAME="${SCRIPT_NAME}"
@@ -220,19 +221,42 @@ restore_port80_forward(){
     fi
 }
 
+# ------------------------------------------------------------------
+# Improved INPUT port-80 handling
+# Detects both classic --dport 80 and multiport --dports …80…
+# Only adds/removes a temporary rule if port 80 was NOT already open
+# ------------------------------------------------------------------
+is_port80_open_in_input(){
+    iptables -S INPUT 2>/dev/null | while read -r r; do
+        case "$r" in
+            -A\ INPUT*)
+                _port80_in_rule "$r" && return 0
+                ;;
+        esac
+    done
+    return 1
+}
+
 add_firewall(){
-    if ! iptables -C INPUT -p tcp --dport 80 -j ACCEPT >/dev/null 2>&1; then
-        iptables -I INPUT -p tcp --dport 80 -j ACCEPT || die "could not open port 80"
-        echo 1 > "${FWFLAG}"
-        echo -e "${f_light_green}opening firewall port 80${reset}"
+    if is_port80_open_in_input; then
+        echo -e "${f_light_green}port 80 already open in INPUT – skipping temporary rule${reset}"
+        logn "port 80 already open in INPUT – skipping temporary rule"
+        return 0
     fi
+
+    iptables -I INPUT -p tcp --dport 80 -j ACCEPT || die "could not open port 80"
+    echo 1 > "${FWFLAG}"
+    echo -e "${f_light_green}opening firewall port 80${reset}"
+    logn "opened temporary INPUT accept for port 80"
 }
 
 remove_firewall(){
+    # Only remove the rule we ourselves added
     if [ -f "${FWFLAG}" ]; then
         iptables -D INPUT -p tcp --dport 80 -j ACCEPT >/dev/null 2>&1 || true
         rm -f "${FWFLAG}"
         echo -e "${f_light_green}closing firewall port 80${reset}"
+        logn "removed temporary INPUT accept for port 80"
     fi
 }
 
@@ -447,7 +471,7 @@ update(){
 }
 
 status() {
-    echo -e "=== HTTPS Certificate Status ==========================="
+    echo -e "=== HTTPS Certificate Status ${v} ======================"
     
     IS_LE_ACTIVE=0
     STAGING_ACTIVE=0
@@ -558,7 +582,7 @@ status() {
 help(){
     cat <<USAGE
 	
-    Tomato64 / FreshTomato – Let's Encrypt helper v1.3 - rs232
+Tomato64 / FreshTomato – Let's Encrypt helper ${v} - rs232
 
 Usage:  ${SCRIPT_NAME} start [--staging]   Install/load/cron cert
         ${SCRIPT_NAME} stop                Restore default cert + remove cron
