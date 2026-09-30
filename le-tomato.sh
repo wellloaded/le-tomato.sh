@@ -1,4 +1,4 @@
-# Execute this directly in the shell
+# Execute directly in the shell
 # ============================================================
 BASE="/opt/letsencrypt"
 # ============================================================
@@ -16,7 +16,7 @@ SCRIPT_PATH="${BASE}/${SCRIPT_NAME}"
 
 cat > "${SCRIPT_PATH}" << EOF
 #!/bin/sh
-v="v1.4"
+v="v1.5"
 # ============================================================
 # Tomato64 / FreshTomato – Let's Encrypt helper ${v} - rs232
 # ============================================================
@@ -42,14 +42,7 @@ ORIGINAL_CERT="${BASE}/original-https-crt-file"
 PORTFWD_FILTER=""
 PORTFWD_NAT=""
 
-if [ -f /usr/sbin/nvram_ops ]; then
     . /usr/sbin/nvram_ops
-else
-    reset="\033[0m"
-    f_light_green="\033[92m"
-    f_light_yellow="\033[93m"
-    f_light_red="\033[91m"
-fi
 
 logi(){ echo "$*" | logger -p user.info -t "${SCRIPT_NAME}[$$]"; }
 logn(){ echo "$*" | logger -p user.notice -t "${SCRIPT_NAME}[$$]"; }
@@ -64,6 +57,71 @@ die(){        echo -e "${f_light_red}ERROR: $*${reset}" >&2; loge "ERROR: $*"; e
 DOMAIN_DIR="${ACME_HOME}/${DOMAIN}"
 PERSIST_CERT="${DOMAIN_DIR}/fullchain.cer"
 PERSIST_KEY="${DOMAIN_DIR}/${DOMAIN}.key"
+
+get_lan_wan_access_status(){
+    LAN_IP=$(nvram get lan_ipaddr)
+    ENTRY="address=/${DOMAIN}/${LAN_IP}"
+    CUR_DNS=$(nvram get dnsmasq_custom 2>/dev/null)
+
+    if echo "${CUR_DNS}" | grep -qF "${ENTRY}"; then
+        echo -e "${f_light_green}DNS Override (${DOMAIN} -> ${LAN_IP})${reset}"
+        return 0
+    fi
+
+    if [ "$(nvram get nf_loopback)" = "0" ]; then
+        echo -e "${f_light_green}NAT Loopback - All (Enabled)${reset}"
+        return 0
+    fi
+
+    echo -e "${f_light_red}None / Unconfigured${reset}"
+}
+
+check_lan_wan_access(){
+    [ -t 0 ] || return 0
+    [ "$(nvram get remote_management)" = "1" ] || return 0
+    [ "$(nvram get https_enable)" = "1" ] || return 0
+
+    LAN_PORT=$(nvram get https_lanport)
+    WAN_PORT=$(nvram get http_wanport)
+    LAN_IP=$(nvram get lan_ipaddr)
+
+    if [ -n "$LAN_PORT" ] && [ "$LAN_PORT" = "$WAN_PORT" ]; then
+        RESOLVED_IP=$(nslookup "${DOMAIN}" 127.0.0.1 2>/dev/null | awk '/^Address 1:/ {print $2}' | tail -n1)
+        [ -z "$RESOLVED_IP" ] && RESOLVED_IP=$(nslookup "${DOMAIN}" 2>/dev/null | awk '/^Address 1:/ {print $2}' | tail -n1)
+
+        if [ "$RESOLVED_IP" != "$LAN_IP" ]; then
+            echo -n -e "${f_light_yellow}${DOMAIN} resolves to WAN IP (${RESOLVED_IP:-unknown}). Add LAN DNS override in dnsmasq? [y/N]: ${reset}"
+            read -r ans
+            case "$ans" in
+                [yY]*)
+                    ENTRY="address=/${DOMAIN}/${LAN_IP}"
+                    CUR_DNS=$(nvram get dnsmasq_custom)
+                    if ! echo "${CUR_DNS}" | grep -qF "${ENTRY}"; then
+                        nvram set dnsmasq_custom="$(printf '%s\n%s' "${CUR_DNS}" "${ENTRY}")"
+                        nvram commit
+                        service dnsmasq restart >/dev/null 2>&1 || true
+                        msg_notice "Added LAN DNS override for ${DOMAIN} -> ${LAN_IP}"
+                    fi
+                    return 0
+                    ;;
+            esac
+        fi
+        return 0
+    fi
+
+    if [ "$(nvram get nf_loopback)" != "0" ]; then
+        echo -n -e "${f_light_yellow}NAT Loopback is required for LAN cert access on distinct WAN ports. Enable NAT Loopback (All)? [y/N]: ${reset}"
+        read -r ans
+        case "$ans" in
+            [yY]*)
+                nvram set nf_loopback=0
+                nvram commit
+                service firewall restart >/dev/null 2>&1 || true
+                msg_notice "NAT Loopback enabled (nf_loopback=0)"
+                ;;
+        esac
+    fi
+}
 
 run_acme(){
     "${ACME}" "$@" 2>&1 | grep -v "Cannot parse _ssldate2time"
@@ -139,7 +197,6 @@ create_handler(){
 #!/bin/sh
 WEBROOT="/opt/letsencrypt/webroot"
 
-# Hard limit: read at most 1024 bytes total (prevents large/slow payloads)
 REQUEST=$(dd bs=1024 count=1 2>/dev/null)
 
 METHOD=$(printf '%s' "$REQUEST" | awk 'NR==1 {print $1}')
@@ -172,9 +229,6 @@ HANDLER
     chmod 700 "${HANDLER}"
 }
 
-# ------------------------------------------------------------------
-# Port-80 forward handling (filter wanin + nat WANPREROUTING)
-# ------------------------------------------------------------------
 _port80_in_rule(){
     echo "$1" | grep -qE -- '--dport[[:space:]]+80([[:space:]]|$)' && return 0
     if echo "$1" | grep -qE -- '--dports[[:space:]]+'; then
@@ -221,11 +275,6 @@ restore_port80_forward(){
     fi
 }
 
-# ------------------------------------------------------------------
-# Improved INPUT port-80 handling
-# Detects both classic --dport 80 and multiport --dports …80…
-# Only adds/removes a temporary rule if port 80 was NOT already open
-# ------------------------------------------------------------------
 is_port80_open_in_input(){
     iptables -S INPUT 2>/dev/null | while read -r r; do
         case "$r" in
@@ -251,7 +300,6 @@ add_firewall(){
 }
 
 remove_firewall(){
-    # Only remove the rule we ourselves added
     if [ -f "${FWFLAG}" ]; then
         iptables -D INPUT -p tcp --dport 80 -j ACCEPT >/dev/null 2>&1 || true
         rm -f "${FWFLAG}"
@@ -305,17 +353,15 @@ start_server(){
     WAN_IP=""
     [ -n "$WAN_IF" ] && WAN_IP=$(ip -4 addr show dev "$WAN_IF" 2>/dev/null | awk '/inet / {print $2; exit}' | cut -d/ -f1)
 
-    # Temporarily free port 80 (Tomato httpd usually holds it)
     service httpd stop >/dev/null 2>&1 || true
     sleep 1
 
     if [ -n "$WAN_IP" ]; then
-        # -s must come before -e for GNU netcat
-        timeout 30 $NC_BIN $NC_LISTEN -s "$WAN_IP" -e "${HANDLER}" &
-        echo -e "${f_light_green}opening listener on $WAN_IF ($WAN_IP:80) [timeout 30s]${reset}"
+        $NC_BIN $NC_LISTEN -s "$WAN_IP" -e "${HANDLER}" &
+        echo -e "${f_light_green}opening listener on $WAN_IF ($WAN_IP:80)${reset}"
     else
-        timeout 30 $NC_BIN $NC_LISTEN -e "${HANDLER}" &
-        echo -e "${f_light_green}opening listener on port 80 (all interfaces) [timeout 30s]${reset}"
+        $NC_BIN $NC_LISTEN -e "${HANDLER}" &
+        echo -e "${f_light_green}opening listener on port 80 (all interfaces)${reset}"
     fi
 
     echo "$!" > "${PIDFILE}"
@@ -334,16 +380,6 @@ install_cron(){
 
 remove_cron(){
     cru d "${CRUNAME}" 2>/dev/null || true
-}
-
-certificate_due(){
-    [ -s "${CERT}" ] || return 0
-    EXPIRY=$(openssl x509 -in "${CERT}" -noout -enddate 2>/dev/null) || return 0
-    EXPIRY="${EXPIRY#*=}"
-    NOW=$(date +%s)
-    END=$(date -d "${EXPIRY}" +%s 2>/dev/null) || return 0
-    REMAINING=$((END - NOW))
-    [ "${REMAINING}" -le 2592000 ]
 }
 
 is_staging_cert(){
@@ -385,7 +421,7 @@ issue_first_certificate(){
     if [ ! -f "${PERSIST_CERT}" ]; then
         if grep -qiE "(Timeout during connect|likely firewall problem)" "${ACME_LOG}" 2>/dev/null; then
             rm -f "${ACME_LOG}"
-            die "Validation timed out — WAN port 80 is unreachable from the Internet (check ISP port blocking or upstream firewall)"
+            die "Validation timed out — WAN port 80 is unreachable from the Internet"
         else
             rm -f "${ACME_LOG}"
             die "initial certificate issuance failed"
@@ -425,6 +461,20 @@ renew_certificate(){
 
 start(){
     [ -n "${DOMAIN}" ] || die "https_crt_cn is empty"
+
+    if [ -s "${PERSIST_CERT}" ] && [ -s "${PERSIST_KEY}" ]; then
+        copy_cert_to_ram
+        if openssl x509 -checkend 2592000 -noout -in "${PERSIST_CERT}" >/dev/null 2>&1 && ! is_staging_cert; then
+            msg_info "using valid existing certificate from ${PERSIST_CERT}"
+            check_lan_wan_access
+            map_certificate
+            install_cron
+            echo -e "LAN to WAN Access   : $(get_lan_wan_access_status)"
+            msg_notice "start completed successfully"
+            return 0
+        fi
+    fi
+
     install_acme
 
     if is_staging_cert && [ "$1" != "--staging" ]; then
@@ -434,13 +484,9 @@ start(){
         issue_first_certificate
         copy_cert_to_ram
     elif [ -s "${PERSIST_CERT}" ] && [ -s "${PERSIST_KEY}" ]; then
-        msg_info "using existing certificate from ${PERSIST_CERT}"
+        save_original_nvram
+        renew_certificate
         copy_cert_to_ram
-        if certificate_due; then
-            save_original_nvram
-            renew_certificate
-            copy_cert_to_ram
-        fi
     else
         save_original_nvram
         issue_first_certificate "$1"
@@ -448,8 +494,10 @@ start(){
     fi
 
     save_original_nvram
+    check_lan_wan_access
     map_certificate
     install_cron
+    echo -e "LAN to WAN Access   : $(get_lan_wan_access_status)"
     msg_notice "start completed successfully"
 }
 
@@ -558,6 +606,8 @@ status() {
         CRON_STATUS="${f_light_yellow}Inactive (Requires initial Let's Encrypt setup)${reset}"
     fi
 
+    ROUTE_STATUS=$(get_lan_wan_access_status)
+
     if [ "${STAGING_ACTIVE}" -eq 1 ] || is_staging_cert; then
         ADVICE="Staging cert active. Run 'le-tomato.sh start' to request production cert."
     elif [ "${IS_LE_ACTIVE}" -eq 1 ]; then
@@ -569,6 +619,7 @@ status() {
     fi
 
     printf "  %-22s : %s\n" "Web Address (Domain)" "${DOMAIN:-Unconfigured}"
+    printf "  %-22s : %b\n" "LAN to WAN Access"   "${ROUTE_STATUS}"	
     printf "  %-22s : %b\n" "HTTPS Security"       "${SEC_STATUS}"
     printf "  %-22s : %b\n" "Certificate Validity" "${EXP_STATUS}"
     printf "  %-22s : %b\n" "Let's Encrypt Cert"  "${LE_DOWNLOAD}"
@@ -580,7 +631,7 @@ status() {
 }
 
 help(){
-    cat <<USAGE
+    cat << 'USAGE'
 	
 Tomato64 / FreshTomato – Let's Encrypt helper ${v} - rs232
 
