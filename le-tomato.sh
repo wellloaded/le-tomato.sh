@@ -1,4 +1,4 @@
-# Execute directly in the shell
+# Configure $BASE here below and execute directly in the shell
 # ============================================================
 BASE="/opt/letsencrypt"
 # ============================================================
@@ -13,18 +13,21 @@ DEFAULT_DOMAIN=$(nvram get https_crt_cn)
 mkdir -p "${BASE}" || exit 1
 SCRIPT_PATH="${BASE}/${SCRIPT_NAME}"
 
-cat > "${SCRIPT_PATH}" << 'EOF'
+# Write the script header (unquoted heredoc so BASE and SCRIPT_NAME expand)
+cat > "${SCRIPT_PATH}" << EOF
 #!/bin/sh
-v="v1.5"
+v="v1.6"
 # ============================================================
-# Tomato64 – Let's Encrypt helper - ${v} - rs232
+# Tomato64 / FreshTomato – Let's Encrypt helper - \${v} - rs232
 # ============================================================
-BASE="/opt/letsencrypt"
-SCRIPT_NAME="le-tomato.sh"
+export PATH=/bin:/usr/bin:/sbin:/usr/sbin:/home/root
+BASE="${BASE}"
+SCRIPT_NAME="${SCRIPT_NAME}"
+SCRIPT_PATH="\${BASE}/\${SCRIPT_NAME}"
 EOF
 
-cat >> "${SCRIPT_PATH}" <<'LE_TOMATO_SCRIPT'
-SCRIPT_PATH="${BASE}/${SCRIPT_NAME}"
+# Write the rest of the script (quoted heredoc)
+cat >> "${SCRIPT_PATH}" << 'LE_TOMATO_SCRIPT'
 
 DOMAIN=$(nvram get https_crt_cn)
 ACME_HOME="${BASE}/.acme.sh"
@@ -41,6 +44,8 @@ ORIGINAL_CERT="${BASE}/original-https-crt-file"
 
 PORTFWD_FILTER=""
 PORTFWD_NAT=""
+NGINX_WAS_STOPPED=0
+DEBUG=0
 
 . /usr/sbin/nvram_ops
 
@@ -49,6 +54,7 @@ logn(){ echo -e "${f_light_green}$*${reset}"; echo "$*" | logger -p user.notice 
 logw(){ echo -e "${f_light_yellow}WARNING: $*${reset}"; echo "WARNING: $*" | logger -p user.warn -t "${SCRIPT_NAME}[$$]"; }
 loge(){ echo -e "${f_light_red}ERROR: $*${reset}" >&2; echo "ERROR: $*" | logger -p user.err -t "${SCRIPT_NAME}[$$]"; }
 die(){  echo -e "${f_light_red}ERROR: $*${reset}" >&2; loge "ERROR: $*"; exit 1; }
+logd(){ [ "$DEBUG" = "1" ] && echo -e "${f_light_cyan}DEBUG: $*${reset}"; }
 
 DOMAIN_DIR="${ACME_HOME}/${DOMAIN}"
 PERSIST_CERT="${DOMAIN_DIR}/fullchain.cer"
@@ -280,7 +286,7 @@ is_port80_open_in_input(){
 
 add_firewall(){
     if is_port80_open_in_input; then
-        logn "port 80 already open in INPUT – skipping temporary rule"
+        logn "port 80 already open in INPUT – leaving iptables untouched"
         return 0
     fi
 
@@ -306,25 +312,39 @@ stop_server(){
     remove_firewall
     restore_port80_forward
     service httpd start >/dev/null 2>&1 || service httpd restart >/dev/null 2>&1 || true
+
+    if [ "${NGINX_WAS_STOPPED}" = "1" ]; then
+        service nginx start >/dev/null 2>&1 || true
+        NGINX_WAS_STOPPED=0
+        logn "restarted nginx"
+    fi
+
     logn "closing listener on port 80"
 }
 
 find_nc(){
-    if command -v nc >/dev/null 2>&1 && nc -h 2>&1 | grep -q -- '-l'; then
+    if [ -x /usr/bin/nc ]; then
+        NC_BIN="/usr/bin/nc"
+    elif command -v nc >/dev/null 2>&1; then
         NC_BIN="nc"
+    else
+        return 1
+    fi
+
+    # Detect the best listen flags for this nc
+    # Tomato64 BusyBox usually supports -lk
+    # FreshTomato BusyBox supports -ll
+    if $NC_BIN -h 2>&1 | grep -q -- '-lk'; then
         NC_LISTEN="-lk -p 80"
+        logd "Using nc ($NC_BIN) with -lk (Tomato64 style)"
         return 0
-    fi
-
-    if [ -x /opt/bin/netcat ] && /opt/bin/netcat -h 2>&1 | grep -q -- '-l'; then
-        NC_BIN="/opt/bin/netcat"
-        NC_LISTEN="-l -p 80"
+    elif $NC_BIN -h 2>&1 | grep -q -- '-ll'; then
+        NC_LISTEN="-ll -p 80"
+        logd "Using nc ($NC_BIN) with -ll (FreshTomato BusyBox)"
         return 0
-    fi
-
-    if command -v netcat >/dev/null 2>&1 && netcat -h 2>&1 | grep -q -- '-l'; then
-        NC_BIN="netcat"
+    elif $NC_BIN -h 2>&1 | grep -q -- '-l'; then
         NC_LISTEN="-l -p 80"
+        logd "Using nc ($NC_BIN) with -l"
         return 0
     fi
 
@@ -339,27 +359,33 @@ start_server(){
     remove_port80_forward
     add_firewall
 
-    find_nc || die "No suitable netcat found (need nc or netcat that supports -l)"
+    NGINX_WAS_STOPPED=0
+    if ps | grep -q '[n]ginx' && netstat -tln 2>/dev/null | grep -qE ':(80|www) '; then
+        service nginx stop >/dev/null 2>&1 || true
+        NGINX_WAS_STOPPED=1
+        logn "temporarily stopped nginx (was listening on port 80)"
+    fi
 
-    WAN_IF=$(nvram get wan_ifname)
-    WAN_IP=""
-    [ -n "$WAN_IF" ] && WAN_IP=$(ip -4 addr show dev "$WAN_IF" 2>/dev/null | awk '/inet / {print $2; exit}' | cut -d/ -f1)
+    find_nc || die "No suitable netcat found (need BusyBox nc that supports -l)"
 
     service httpd stop >/dev/null 2>&1 || true
     sleep 1
 
-    if [ -n "$WAN_IP" ]; then
-        $NC_BIN $NC_LISTEN -s "$WAN_IP" -e "${HANDLER}" &
-        logn "opening listener on $WAN_IF ($WAN_IP:80)"
-    else
-        $NC_BIN $NC_LISTEN -e "${HANDLER}" &
-        logn "opening listener on port 80 (all interfaces)"
-    fi
+    logd "NC_BIN=$NC_BIN  NC_LISTEN=$NC_LISTEN"
+
+    # Note: we do not use -s (source address) – not supported on all BusyBox variants
+    $NC_BIN $NC_LISTEN -e "${HANDLER}" &
+    logn "opening listener on port 80"
 
     echo "$!" > "${PIDFILE}"
     sleep 1
 
-    kill -0 "$(cat "${PIDFILE}" 2>/dev/null)" 2>/dev/null || die "listener failed to bind port 80"
+    if ! kill -0 "$(cat "${PIDFILE}" 2>/dev/null)" 2>/dev/null; then
+        die "listener failed to bind port 80"
+    fi
+
+    logd "Listener PID=$(cat "${PIDFILE}")"
+    [ "$DEBUG" = "1" ] && netstat -tlnp 2>/dev/null | grep :80
 }
 
 install_cron(){
@@ -461,6 +487,15 @@ renew_certificate(){
 start(){
     [ -n "${DOMAIN}" ] || die "https_crt_cn is empty"
 
+    case "$1" in
+        debug|--debug) DEBUG=1; shift ;;
+    esac
+    case "$2" in
+        debug|--debug) DEBUG=1 ;;
+    esac
+
+    [ "$DEBUG" = "1" ] && logd "Debug mode enabled"
+
     if [ -s "${PERSIST_CERT}" ] && [ -s "${PERSIST_KEY}" ]; then
         copy_cert_to_ram
         if openssl x509 -checkend 2592000 -noout -in "${PERSIST_CERT}" >/dev/null 2>&1 && ! is_staging_cert; then
@@ -539,7 +574,6 @@ status() {
         SEC_STATUS="${f_light_red}No Active Certificate${reset}"
     fi
 
-    # Let's Encrypt status and expiration evaluation
     if [ -s "${PERSIST_CERT}" ]; then
         if is_staging_cert; then
             LE_DOWNLOAD="${f_light_yellow}Test/Staging Mode (Not a real cert)${reset}"
@@ -636,12 +670,16 @@ help(){
     echo "
 	Tomato64 / FreshTomato – Let's Encrypt helper ${v} - rs232
 	"
-    echo "Usage:  ${SCRIPT_NAME} start [--staging]   Install/load/cron cert"
-    echo "        ${SCRIPT_NAME} stop                Restore default cert + remove cron"
-    echo "        ${SCRIPT_NAME} status              Show status"
-    echo "        ${SCRIPT_NAME} reload              Re-map certificate to NVRAM"
-    echo "        ${SCRIPT_NAME} update              Update acme.sh"
-    echo "        ${SCRIPT_NAME} help                Show this help"
+    echo "Usage:  ${SCRIPT_NAME} start [debug|--debug] [--staging]"
+    echo "        ${SCRIPT_NAME} stop"
+    echo "        ${SCRIPT_NAME} status"
+    echo "        ${SCRIPT_NAME} reload"
+    echo "        ${SCRIPT_NAME} update"
+    echo "        ${SCRIPT_NAME} help"
+    echo ""
+    echo "  start          Install / renew certificate and enable auto-renew"
+    echo "  start debug    Same as start but with extra troubleshooting output"
+    echo "  start --staging  Request a staging (test) certificate"
     echo ""
     echo "Add to Init / WAN Up:"
     echo "        ${SCRIPT_PATH} start
@@ -649,7 +687,7 @@ help(){
 }
 
 case "$1" in
-    start) start "$2" ;;
+    start) start "$2" "$3" ;;
     stop) stop ;;
     status) status ;;
     reload) reload ;;
